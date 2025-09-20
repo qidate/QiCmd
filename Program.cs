@@ -1,0 +1,1194 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Runtime.Remoting.Messaging;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+namespace QiCmd
+{
+    internal class Program
+    {
+        private static string _currentDirectory = Environment.CurrentDirectory;
+
+        static void Main(string[] args)
+        {
+            Console.Clear();
+            Console.WriteLine("QiCmd [版本 0.1]");
+
+            while (true)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.Write($"\n{_currentDirectory}>");
+                Console.ResetColor();
+                string input = Console.ReadLine();
+
+                if (string.IsNullOrWhiteSpace(input))
+                    continue;
+
+                if (input.Equals("exit", StringComparison.OrdinalIgnoreCase))
+                    break;
+
+                string parsedCommand = QiCmdParser.ParseCommand(input);
+
+                // 处理特殊命令
+                if (TryHandleBuiltInCommand(parsedCommand))
+                    continue;
+
+                ExecuteCommand(parsedCommand);
+            }
+        }
+
+        private static bool TryHandleBuiltInCommand(string command)
+        {
+            string[] parts = command.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0)
+                return false;
+
+            string cmd = parts[0].ToLower();
+
+            switch (cmd)
+            {
+                case "cd":
+                    HandleCdCommand(parts);
+                    return true;
+
+                case "chdir":
+                    HandleCdCommand(parts);
+                    return true;
+
+                case "pwd":
+                    Console.WriteLine(_currentDirectory);
+                    return true;
+
+                case "cls":
+                    Console.Clear();
+                    return true;
+
+                case "echo":
+                    if (parts.Length > 1)
+                        Console.WriteLine(string.Join(" ", parts.Skip(1)));
+                    else
+                        Console.WriteLine();
+                    return true;
+
+                case "io": case "fe":
+                    FileExplorer explorer = new FileExplorer(_currentDirectory);
+                    explorer.Run();
+                    return true;
+
+                default:
+                    return false;
+            }
+        }
+
+        private static void HandleCdCommand(string[] parts)
+        {
+            if (parts.Length == 1)
+            {
+                // 显示当前目录
+                Console.WriteLine(_currentDirectory);
+                return;
+            }
+
+            string targetPath = parts[1];
+
+            try
+            {
+                string newPath = Path.GetFullPath(Path.Combine(_currentDirectory, targetPath));
+
+                if (Directory.Exists(newPath))
+                {
+                    _currentDirectory = newPath;
+                    Environment.CurrentDirectory = newPath; // 同时设置进程当前目录
+                    Console.WriteLine($"当前目录已更改为: {_currentDirectory}");
+                }
+                else
+                {
+                    Console.WriteLine($"系统找不到指定的路径: {targetPath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"错误: {ex.Message}");
+            }
+        }
+
+        private static void ExecuteCommand(string command)
+        {
+            if (IsInteractiveCommand(command))
+            {
+                // 交互式命令：直接执行，不重定向
+                Process.Start("cmd.exe", $"/C {command}")?.WaitForExit();
+            }
+            else
+            {
+                // 普通命令：重定向输出
+                Process process = new Process();
+                ProcessStartInfo startInfo = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/C {command}",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = _currentDirectory
+                };
+
+                process.StartInfo = startInfo;
+                process.OutputDataReceived += (sender, e) =>
+                {
+                    if (!string.IsNullOrEmpty(e.Data))
+                    {
+                        Console.ForegroundColor = ConsoleColor.White;
+                        Console.WriteLine(e.Data);
+                        Console.ResetColor();
+                    }
+                };
+                process.ErrorDataReceived += (sender, e) =>
+                {
+                    if (!string.IsNullOrEmpty(e.Data))
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine("ERROR: " + e.Data);
+                        Console.ResetColor();
+                    }
+                };
+
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                process.WaitForExit();
+            }
+        }
+
+        private static bool IsInteractiveCommand(string command)
+        {
+            var interactiveCommands = new[] { "cmd", "powershell", "bash", "ssh", "telnet" };
+            var firstWord = command.Split(' ')[0].ToLower();
+            return interactiveCommands.Contains(firstWord);
+        }
+    }
+    
+    
+
+
+
+
+
+
+    public class QiCmdParser
+    {
+        private const bool DeBugMode = true;
+
+        // 时间单位转换字典
+        private static readonly Dictionary<char, long> TimeUnits = new Dictionary<char, long>
+        {
+            {'s', 1}, {'S', 1},
+            {'m', 60}, {'M', 60},
+            {'h', 3600}, {'H', 3600},
+            {'d', 86400}, {'D', 86400}
+        };
+
+        // 转换器注册表
+        private static readonly Dictionary<string, Func<string, string>> Converters =
+            new Dictionary<string, Func<string, string>>(StringComparer.OrdinalIgnoreCase)
+            {
+                // 类型默认转换器
+                {"Number", value => {
+                    try { return int.Parse(value).ToString(); }
+                    catch { return value; }
+                }},
+                {"Time", value => {
+                    // Time 转换器应该处理时间表达式，而不是日期字符串
+                    try { return SecondsToTimeFormat(int.Parse(value)); }
+                    catch { 
+                        // 如果不是数字，检查是否是时间表达式
+                        if (IsTimeExpression(value)) return value;
+                        return value;
+                    }
+                }},
+                {"String", value => value},
+                {"Boolean", value => value.ToLower()},
+                {"Date", value => {
+                    try {
+                        DateTime date;
+                        if (DateTime.TryParse(value, out date))
+                            return date.ToString("yyyy/MM/dd HH:mm:ss");
+                        return value;
+                    }
+                    catch { return value; }
+                }},
+        
+                // 类型特定操作转换器
+                {"Number.Length", value => value.Length.ToString()},
+                {"Number.Double", value => double.Parse(value).ToString()},
+                {"Number.Abs", value => {
+                    try
+                    {
+                        if (int.TryParse(value, out int number))
+                            return Math.Abs(number).ToString();
+                        if (double.TryParse(value, out double doubleNumber))
+                            return Math.Abs(doubleNumber).ToString();
+                        return value;
+                    }
+                    catch { return value; }
+                }},
+                {"Number.Neg", value => {
+                    try
+                    {
+                        if (int.TryParse(value, out int number))
+                            return (-number).ToString();
+                        if (double.TryParse(value, out double doubleNumber))
+                            return (-doubleNumber).ToString();
+                        return value;
+                    }
+                    catch { return value; }
+                }},
+                {"Number.Round", value => {
+                    try
+                    {
+                        if (double.TryParse(value, out double number))
+                            return Math.Round(number).ToString();
+                        return value;
+                    }
+                    catch { return value; }
+                }},
+
+                {"Time.Sec", value => ParseTimeToTotalSeconds(value).ToString()},
+                {"Time.Min", value => ParseTimeToMinutes(value)},
+                {"Time.Hour", value => ParseTimeToHours(value)},
+                {"Time.Day", value => ParseTimeToDays(value)},
+
+                {"String.Upper", value => value.ToUpper()},
+                {"String.Lower", value => value.ToLower()},
+                {"String.Length", value => value.Length.ToString()},
+        
+                // Boolean 操作转换器
+                {"Boolean.Not", value => (!bool.Parse(value)).ToString().ToLower()},
+                {"Boolean.Number", value => bool.Parse(value) ? "1" : "0"},
+        
+                // 类型间转换器
+                {"Time.Number", value => ParseTimeToTotalSeconds(value).ToString()},
+                {"Number.String", value => value},
+                {"String.Number", value => double.TryParse(value, out _) ? value : "0"},
+
+                // 关键的转换器：Date.Time（日期转时间差）
+                // Date.Time 转换器
+                {"Date.Time", value => {
+                    try
+                    {
+                        DateTime targetDate;
+                        if (DateTime.TryParse(value, out targetDate) ||
+                            DateTime.TryParseExact(value, "yyyy/MM/dd HH:mm:ss", null,
+                                System.Globalization.DateTimeStyles.None, out targetDate) ||
+                            DateTime.TryParseExact(value, "yyyy-MM-dd HH:mm:ss", null,
+                                System.Globalization.DateTimeStyles.None, out targetDate))
+                        {
+                            TimeSpan difference = targetDate - DateTime.Now;
+                            int totalSeconds = (int)difference.TotalSeconds;
+
+                            OutDebugText($"日期差异 - 现在: {DateTime.Now}, 目标: {targetDate}, 差异: {difference}");
+
+                            if (totalSeconds == 0) return "0s";
+                            if (totalSeconds < 0) return "-" + SecondsToTimeFormat(Math.Abs(totalSeconds));
+                            return SecondsToTimeFormat(totalSeconds);
+                        }
+                        OutDebugText($"解析日期失败: {value}");
+                        return value;
+                    }
+                    catch (Exception ex)
+                    {
+                        OutDebugText($"Date.Time error: {ex.Message}");
+                        return value;
+                    }
+                }},
+        
+                // Date.Now 转换器
+                {"Date.Now", value => {
+                    try
+                    {
+                        TimeSpan timeSpan = ParseTimeToTimeSpan(value);
+                        DateTime result = DateTime.Now.Add(timeSpan);
+                        OutDebugText($"Date.Now - 输入: {value}, 时间跨度: {timeSpan}, 结果: {result}");
+                        return result.ToString("yyyy/MM/dd HH:mm:ss");
+                    }
+                    catch (Exception ex)
+                    {
+                        OutDebugText($"Date.Now error: {ex.Message}");
+                        return value;
+                    }
+                }},
+                {"Date.UTC", value => {
+                    try
+                    {
+                        TimeSpan timeSpan = ParseTimeToTimeSpan(value);
+                        return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+                            .Add(timeSpan).ToString("yyyy/MM/dd HH:mm:ss");
+                    }
+                    catch { return value; }
+                }},
+                {"Date.Today", value => {
+                    try
+                    {
+                        TimeSpan timeSpan = ParseTimeToTimeSpan(value);
+                        return DateTime.Today.Add(timeSpan).ToString("yyyy/MM/dd HH:mm:ss");
+                    }
+                    catch { return value; }
+                }}
+            };
+
+        /// <summary>
+        /// 解析命令字符串，转换所有表达式
+        /// </summary>
+        public static string ParseCommand(string inputCommand)
+        {
+            if (string.IsNullOrWhiteSpace(inputCommand))
+                return inputCommand;
+
+            // 处理管道表达式：支持显式 $[Type:Value => ...] 和隐式 $[?:Value => ...]
+            string pipelinePattern = @"\$\[\s*(\??\w*)\s*:\s*([^=\]]+?)(?:\s*=>\s*([^\]]+))?\s*\]";
+            return Regex.Replace(inputCommand, pipelinePattern, match =>
+            {
+                string typeName = match.Groups[1].Value;
+                string value = match.Groups[2].Value.Trim();
+                string pipeline = match.Groups[3].Success ? match.Groups[3].Value.Trim() : null;
+
+                // 处理隐式类型（? 或空类型）
+                if (string.IsNullOrEmpty(typeName) || typeName == "?")
+                {
+                    typeName = DetectValueType(value);
+                }
+
+                return ParsePipelineExpression(typeName, value, pipeline);
+            });
+        }
+
+        /// <summary>
+        /// 智能检测值的类型
+        /// </summary>
+        private static string DetectValueType(string value)
+        {
+            value = value.Trim();
+
+            // 检测日期时间格式
+            DateTime dateResult;
+            if (DateTime.TryParse(value, out dateResult))
+            {
+                return "Date";
+            }
+
+            // 原有的检测逻辑...
+            if (Regex.IsMatch(value, @"^\d+[smhdSMHD](\d+[smhdSMHD])*$") ||
+                Regex.IsMatch(value, @"^\d+[smhdSMHD]?$"))
+            {
+                return "Time";
+            }
+
+            if (int.TryParse(value, out _) || double.TryParse(value, out _))
+            {
+                return "Number";
+            }
+
+            if (value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("false", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Boolean";
+            }
+
+            return "String";
+        }
+
+        /// <summary>
+        /// 解析管道表达式
+        /// </summary>
+        private static string ParsePipelineExpression(string initialType, string initialValue, string pipeline)
+        {
+            string currentValue = initialValue;
+            string currentType = initialType;
+
+            OutDebugText($"开始 {initialType}:{initialValue} => {pipeline}");
+
+            if (string.IsNullOrWhiteSpace(pipeline))
+            {
+                if (Converters.TryGetValue(currentType, out var converter))
+                {
+                    return converter(currentValue);
+                }
+                return currentValue;
+            }
+
+            var steps = pipeline.Split(new[] { "=>" }, StringSplitOptions.RemoveEmptyEntries)
+                               .Select(step => step.Trim())
+                               .Where(step => !string.IsNullOrEmpty(step))
+                               .ToList();
+
+            foreach (string step in steps)
+            {
+                OutDebugText($"步骤 '{step}', 当前: {currentType}:{currentValue}");
+
+                // 对于 Date => Time 这种情况，我们需要使用 Date.Time 转换器
+                if (currentType == "Date" && step == "Time")
+                {
+                    string converterKey = "Date.Time";
+                    OutDebugText($"使用特定转换器: {converterKey}");
+
+                    if (Converters.TryGetValue(converterKey, out var converter))
+                    {
+                        try
+                        {
+                            currentValue = converter(currentValue);
+                            currentType = "Time";
+                            OutDebugText($"转换为: {currentValue} (类型: {currentType})");
+                            continue;
+                        }
+                        catch (Exception ex)
+                        {
+                            OutDebugText($"转换失败: {ex.Message}");
+                            return currentValue;
+                        }
+                    }
+                }
+
+                // 查找完整的转换器键名
+                if (step.Contains('.'))
+                {
+                    string converterKey = step;
+                    OutDebugText($"寻找转换器: {converterKey}");
+
+                    if (Converters.TryGetValue(converterKey, out var converter))
+                    {
+                        try
+                        {
+                            currentValue = converter(currentValue);
+                            currentType = step.Split('.')[0];
+                            OutDebugText($"转换为: {currentValue} (类型: {currentType})");
+                            continue;
+                        }
+                        catch (Exception ex)
+                        {
+                            OutDebugText($"转换失败: {ex.Message}");
+                            return currentValue;
+                        }
+                    }
+                }
+
+                // 查找类型默认转换器
+                string typeConverterKey = step;
+                OutDebugText($"寻找类型转换器: {typeConverterKey}");
+
+                if (Converters.TryGetValue(typeConverterKey, out var typeConverter))
+                {
+                    try
+                    {
+                        currentValue = typeConverter(currentValue);
+                        currentType = step;
+                        OutDebugText($"转换为: {currentValue} (类型: {currentType})");
+                    }
+                    catch (Exception ex)
+                    {
+                        OutDebugText($"类型转换失败: {ex.Message}");
+                        return currentValue;
+                    }
+                }
+                else
+                {
+                    OutDebugText($"类型未找到: {typeConverterKey}");
+                    return currentValue;
+                }
+            }
+
+            return currentValue;
+        }
+
+
+        // 时间转换方法
+        private static string ParseTimeToMinutes(string timeExpression)
+        {
+            long totalSeconds = ParseTimeToTotalSeconds(timeExpression);
+            double minutes = (double)totalSeconds / 60;
+            return Math.Round(minutes).ToString();
+        }
+
+        private static string ParseTimeToHours(string timeExpression)
+        {
+            long totalSeconds = ParseTimeToTotalSeconds(timeExpression);
+            double hours = (double)totalSeconds / 3600;
+            return Math.Round(hours).ToString();
+        }
+
+        private static string ParseTimeToDays(string timeExpression)
+        {
+            long totalSeconds = ParseTimeToTotalSeconds(timeExpression);
+            double days = (double)totalSeconds / 86400;
+            return Math.Round(days).ToString();
+        }
+
+        private static long ParseTimeToTotalSeconds(string timeExpression)
+        {
+            timeExpression = timeExpression.Trim().ToLower();
+
+            if (int.TryParse(timeExpression, out var seconds))
+            {
+                return seconds;
+            }
+
+            long totalSeconds = 0;
+            var matches = Regex.Matches(timeExpression, @"(\d+)([smhd])");
+
+            foreach (Match match in matches)
+            {
+                if (match.Success)
+                {
+                    var number = int.Parse(match.Groups[1].Value);
+                    var unit = match.Groups[2].Value;
+
+                    if (TimeUnits.TryGetValue(unit[0], out var multiplier))
+                    {
+                        totalSeconds += number * multiplier;
+                    }
+                }
+            }
+
+            return totalSeconds;
+        }
+
+        // 将秒数转换为时间格式
+        private static string SecondsToTimeFormat(int totalSeconds)
+        {
+            if (totalSeconds == 0)
+                return "0s";
+
+            int remainingSeconds = Math.Abs(totalSeconds);
+            var timeParts = new List<string>();
+
+            // 天数
+            int days = remainingSeconds / 86400;
+            if (days > 0)
+            {
+                timeParts.Add($"{days}d");
+                remainingSeconds %= 86400;
+            }
+
+            // 小时
+            int hours = remainingSeconds / 3600;
+            if (hours > 0)
+            {
+                timeParts.Add($"{hours}h");
+                remainingSeconds %= 3600;
+            }
+
+            // 分钟
+            int minutes = remainingSeconds / 60;
+            if (minutes > 0)
+            {
+                timeParts.Add($"{minutes}m");
+                remainingSeconds %= 60;
+            }
+
+            // 秒
+            if (remainingSeconds > 0)
+            {
+                timeParts.Add($"{remainingSeconds}s");
+            }
+
+            return string.Join("", timeParts);
+        }
+
+        /// <summary>
+        /// 将时间表达式转换为 TimeSpan
+        /// </summary>
+        private static TimeSpan ParseTimeToTimeSpan(string timeExpression)
+        {
+            long totalSeconds = ParseTimeToTotalSeconds(timeExpression);
+            return TimeSpan.FromSeconds(totalSeconds);
+        }
+
+        /// <summary>
+        /// 判断是否为时间表达式
+        /// </summary>
+        private static bool IsTimeExpression(string expression)
+        {
+            if (string.IsNullOrWhiteSpace(expression))
+                return false;
+
+            expression = expression.Trim();
+
+            // 纯数字（表示秒数）
+            if (int.TryParse(expression, out _))
+                return true;
+
+            // 时间格式：1h, 30m, 2d10h30m, 1h20m30s 等
+            if (Regex.IsMatch(expression, @"^(\d+[smhdSMHD])+$"))
+                return true;
+
+            // 带数字的时间格式：1h, 30m 等（单个单位）
+            if (Regex.IsMatch(expression, @"^\d+[smhdSMHD]?$"))
+                return true;
+
+            return false;
+        }
+
+        private static void OutDebugText(string message)
+        {
+            if(DeBugMode)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"DEBUG: {message}");
+                Console.ResetColor();
+            }
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    public class FileExplorer
+    {
+        private string currentDirectory;
+        private List<FileSystemInfo> currentItems;
+        private int currentPage = 1;
+        private const int PageSize = 50 + 1;
+
+        public FileExplorer(string startDirectory = null)
+        {
+            currentDirectory = startDirectory ?? Directory.GetCurrentDirectory();
+            currentItems = new List<FileSystemInfo>();
+        }
+
+        public void Run()
+        {
+            while (true)
+            {
+                try
+                {
+                    RefreshDisplay();
+                    if (HandleInput() == "exit")
+                        break;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"错误: {ex.Message}");
+                    Console.WriteLine("按任意键继续...");
+                    Console.ReadKey();
+                }
+            }
+        }
+
+        private void RefreshDisplay()
+        {
+            Console.Clear();
+            LoadCurrentDirectoryItems();
+            DisplayHeader();
+            DisplayFileList();
+            DisplayFooter();
+        }
+
+        private void LoadCurrentDirectoryItems()
+        {
+            currentItems.Clear();
+
+            // 添加父目录（如果不是根目录）
+            if (Directory.GetParent(currentDirectory) != null)
+            {
+                currentItems.Add(new DirectoryInfo(".."));
+            }
+
+            // 添加目录
+            var directories = Directory.GetDirectories(currentDirectory)
+                .Select(path => new DirectoryInfo(path))
+                .OrderBy(d => d.Name);
+            currentItems.AddRange(directories);
+
+            // 添加文件
+            var files = Directory.GetFiles(currentDirectory)
+                .Select(path => new FileInfo(path))
+                .OrderBy(f => f.Name);
+            currentItems.AddRange(files);
+        }
+
+        private void DisplayHeader()
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("╔══════════════════════════════════════════════════════════╗");
+            Console.WriteLine($"║ 文件资源管理器 - {TruncateMiddle(currentDirectory, 50)} ║");
+            Console.WriteLine("╚══════════════════════════════════════════════════════════╝");
+            Console.ResetColor();
+
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("  序号  类型      大小          修改时间              名称");
+            Console.WriteLine("════════════════════════════════════════════════════════════");
+            Console.ResetColor();
+        }
+
+        private void DisplayFileList()
+        {
+            int startIndex = (currentPage - 1) * PageSize;
+            int endIndex = Math.Min(startIndex + PageSize, currentItems.Count);
+
+            for (int i = startIndex; i < endIndex; i++)
+            {
+                var item = currentItems[i];
+                int displayNumber = i;
+
+                if (item.Name == "..")
+                {
+                    DisplayBackItem(displayNumber);
+                }
+                else if (item is DirectoryInfo dir)
+                {
+                    DisplayDirectoryItem(displayNumber, dir);
+                }
+                else if (item is FileInfo file)
+                {
+                    DisplayFileItem(displayNumber, file);
+                }
+            }
+        }
+
+        private void DisplayBackItem(int number)
+        {
+            Console.ForegroundColor = ConsoleColor.Blue;
+            Console.Write($"[{number,2}] ");
+            Console.ForegroundColor = ConsoleColor.Magenta;
+            Console.Write("⬆ 返回  ");
+            Console.ResetColor();
+            Console.WriteLine("上级目录");
+        }
+
+        private void DisplayDirectoryItem(int number, DirectoryInfo dir)
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.Write($"[{number,2}] ");
+            Console.ForegroundColor = ConsoleColor.Blue;
+            Console.Write("📁 目录  ");
+            Console.ResetColor();
+            Console.Write($"{GetLastWriteTime(dir.LastWriteTime),-20}");
+            Console.ForegroundColor = ConsoleColor.White;
+            Console.WriteLine($" {dir.Name}");
+            Console.ResetColor();
+        }
+
+        private void DisplayFileItem(int number, FileInfo file)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.Write($"[{number,2}] ");
+            Console.ForegroundColor = ConsoleColor.Gray;
+            Console.Write("📄 文件  ");
+            Console.Write($"{GetFileSize(file.Length),-12}");
+            Console.Write($"{GetLastWriteTime(file.LastWriteTime),-20}");
+
+            SetFileColor(file.Extension);
+            Console.WriteLine($" {file.Name}");
+            Console.ResetColor();
+        }
+
+        private void SetFileColor(string extension)
+        {
+            switch (extension.ToLower())
+            {
+                case ".txt":
+                case ".md":
+                case ".log":
+                    Console.ForegroundColor = ConsoleColor.White;
+                    break;
+                case ".exe":
+                case ".bat":
+                case ".cmd":
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    break;
+                case ".jpg":
+                case ".png":
+                case ".gif":
+                case ".bmp":
+                    Console.ForegroundColor = ConsoleColor.Magenta;
+                    break;
+                case ".mp3":
+                case ".wav":
+                case ".flac":
+                    Console.ForegroundColor = ConsoleColor.DarkYellow;
+                    break;
+                case ".mp4":
+                case ".avi":
+                case ".mkv":
+                    Console.ForegroundColor = ConsoleColor.DarkMagenta;
+                    break;
+                case ".zip":
+                case ".rar":
+                case ".7z":
+                    Console.ForegroundColor = ConsoleColor.DarkCyan;
+                    break;
+                default:
+                    Console.ForegroundColor = ConsoleColor.Gray;
+                    break;
+            }
+        }
+
+        private void DisplayFooter()
+        {
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine("════════════════════════════════════════════════════════════");
+
+            int totalPages = (int)Math.Ceiling((double)currentItems.Count / PageSize);
+            if (totalPages > 1)
+            {
+                Console.WriteLine($"第 {currentPage}/{totalPages} 页 | ");
+            }
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("命令: [数字]选择 | q 上一页 | p 下一页 | e 退出");
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine("════════════════════════════════════════════════════════════");
+            Console.Write("输入: ");
+            Console.ResetColor();
+        }
+
+        private string HandleInput()
+        {
+            string input = Console.ReadLine()?.Trim();
+
+            if (string.IsNullOrEmpty(input)) return "";
+
+            switch (input.ToLower())
+            {
+                case "q":
+                    if (currentPage > 1) currentPage--;
+                    break;
+                case "p":
+                    if (currentPage < (int)Math.Ceiling((double)currentItems.Count / PageSize)) currentPage++;
+                    break;
+                case "e":
+                    return "exit";
+                case "..":
+                    NavigateToParent();
+                    break;
+                default:
+                    if (int.TryParse(input, out int selection))
+                    {
+                        HandleSelection(selection);
+                    }
+                    break;
+            }
+            return input.ToLower();
+        }
+
+        private void HandleSelection(int selection)
+        {
+            if (selection >= 0 && selection < currentItems.Count)
+            {
+                var selectedItem = currentItems[selection];
+
+                if (selectedItem.Name == "..")
+                {
+                    NavigateToParent();
+                }
+                else if (selectedItem is DirectoryInfo dir)
+                {
+                    currentDirectory = dir.FullName;
+                    currentPage = 1;
+                }
+                else if (selectedItem is FileInfo file)
+                {
+                    ShowFileMenu(file);
+                }
+            }
+        }
+
+        private void ShowFileMenu(FileInfo file)
+        {
+            while (true)
+            {
+                Console.Clear();
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine("╔══════════════════════════════════════════════════════════╗");
+                Console.WriteLine($"║ 文件操作: {TruncateMiddle(file.Name, 50)} ║");
+                Console.WriteLine("╚══════════════════════════════════════════════════════════╝");
+                Console.ResetColor();
+                Console.WriteLine();
+
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("  0. 返回文件列表");
+                Console.WriteLine("  1. 打开文件");
+                Console.WriteLine("  2. 删除文件");
+                Console.WriteLine("  3. 重命名文件");
+                Console.WriteLine("  4. 查看文件内容");
+                Console.ResetColor();
+
+                Console.WriteLine();
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write("请选择操作 (0-4): ");
+                Console.ResetColor();
+
+                string input = Console.ReadLine()?.Trim();
+
+                switch (input)
+                {
+                    case "0":
+                        return; // 返回文件列表
+                    case "1":
+                        OpenFile(file);
+                        break;
+                    case "2":
+                        DeleteFile(file);
+                        break;
+                    case "3":
+                        RenameFile(file);
+                        break;
+                    case "4":
+                        ViewFileContent(file);
+                        break;
+                    default:
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine("无效的选择，请重新输入");
+                        Console.ResetColor();
+                        Console.WriteLine("按任意键继续...");
+                        Console.ReadKey();
+                        break;
+                }
+            }
+        }
+
+        private void OpenFile(FileInfo file)
+        {
+            Console.Clear();
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"╔══════════════════════════════════════════════════════════╗");
+            Console.WriteLine($"║ 打开文件: {TruncateMiddle(file.Name, 50)} ║");
+            Console.WriteLine($"╚══════════════════════════════════════════════════════════╝");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = file.FullName,
+                    UseShellExecute = true
+                });
+
+                Console.WriteLine("文件已用默认程序打开");
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"无法打开文件: {ex.Message}");
+                Console.ResetColor();
+            }
+
+            Console.WriteLine("\n按任意键返回...");
+            Console.ReadKey();
+        }
+
+        private void DeleteFile(FileInfo file)
+        {
+            Console.Clear();
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"╔══════════════════════════════════════════════════════════╗");
+            Console.WriteLine($"║ 删除文件: {TruncateMiddle(file.Name, 50)} ║");
+            Console.WriteLine($"╚══════════════════════════════════════════════════════════╝");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.Write("确认要删除这个文件吗？(y/N): ");
+            Console.ResetColor();
+
+            string confirm = Console.ReadLine()?.Trim().ToLower();
+            if (confirm == "y" || confirm == "yes")
+            {
+                try
+                {
+                    file.Delete();
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine("文件已成功删除");
+                    Console.ResetColor();
+                }
+                catch (Exception ex)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"删除文件失败: {ex.Message}");
+                    Console.ResetColor();
+                }
+            }
+            else
+            {
+                Console.WriteLine("取消删除操作");
+            }
+
+            Console.WriteLine("\n按任意键返回...");
+            Console.ReadKey();
+        }
+
+        private void RenameFile(FileInfo file)
+        {
+            Console.Clear();
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"╔══════════════════════════════════════════════════════════╗");
+            Console.WriteLine($"║ 重命名文件: {TruncateMiddle(file.Name, 50)} ║");
+            Console.WriteLine($"╚══════════════════════════════════════════════════════════╝");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            Console.Write($"请输入新文件名 (当前: {file.Name}): ");
+            string newName = Console.ReadLine()?.Trim();
+
+            if (string.IsNullOrEmpty(newName))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("文件名不能为空");
+                Console.ResetColor();
+            }
+            else
+            {
+                try
+                {
+                    string newPath = Path.Combine(file.DirectoryName, newName);
+                    file.MoveTo(newPath);
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine("文件重命名成功");
+                    Console.ResetColor();
+                }
+                catch (Exception ex)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"重命名失败: {ex.Message}");
+                    Console.ResetColor();
+                }
+            }
+
+            Console.WriteLine("\n按任意键返回...");
+            Console.ReadKey();
+        }
+
+        private void ViewFileContent(FileInfo file)
+        {
+            Console.Clear();
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"╔══════════════════════════════════════════════════════════╗");
+            Console.WriteLine($"║ 查看文件内容: {TruncateMiddle(file.Name, 50)} ║");
+            Console.WriteLine($"╚══════════════════════════════════════════════════════════╝");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            try
+            {
+                // 检查文件大小，避免读取过大文件
+                if (file.Length > 1024 * 1024) // 1MB
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine("文件较大，是否继续查看？(y/N): ");
+                    Console.ResetColor();
+                    string confirm = Console.ReadLine()?.Trim().ToLower();
+                    if (confirm != "y" && confirm != "yes")
+                    {
+                        return;
+                    }
+                }
+
+                // 尝试以文本格式读取文件
+                using (var reader = new StreamReader(file.FullName))
+                {
+                    Console.ForegroundColor = ConsoleColor.White;
+                    Console.WriteLine("════════════════════════════════════════════════════════════");
+                    Console.ResetColor();
+
+                    string line;
+                    int lineCount = 0;
+                    while ((line = reader.ReadLine()) != null && lineCount < 1000) // 限制显示1000行
+                    {
+                        Console.WriteLine(line);
+                        lineCount++;
+
+                        // 每50行暂停一次
+                        if (lineCount % 50 == 0)
+                        {
+                            Console.ForegroundColor = ConsoleColor.DarkGray;
+                            Console.WriteLine($"--- 已显示 {lineCount} 行，按任意键继续，按q退出查看 ---");
+                            Console.ResetColor();
+                            if (Console.ReadKey(true).KeyChar == 'q')
+                                break;
+                        }
+                    }
+
+                    if (lineCount >= 1000)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine("--- 文件内容较多，已截断显示 ---");
+                        Console.ResetColor();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"读取文件失败: {ex.Message}");
+                Console.ResetColor();
+            }
+
+            Console.WriteLine("\n按任意键返回...");
+            Console.ReadKey();
+        }
+
+        private void NavigateToParent()
+        {
+            var parent = Directory.GetParent(currentDirectory);
+            if (parent != null)
+            {
+                currentDirectory = parent.FullName;
+                currentPage = 1;
+            }
+        }
+
+        // 辅助方法
+        private string GetFileSize(long bytes)
+        {
+            string[] sizes = { "B", "KB", "MB", "GB" };
+            int order = 0;
+            double len = bytes;
+            while (len >= 1024 && order < sizes.Length - 1)
+            {
+                order++;
+                len = len / 1024;
+            }
+            return $"{len:0.##} {sizes[order]}";
+        }
+
+        private string GetLastWriteTime(DateTime time)
+        {
+            return time.ToString("yyyy-MM-dd HH:mm");
+        }
+
+        private string TruncateMiddle(string value, int maxLength)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
+                return value.PadRight(maxLength);
+
+            int halfLength = (maxLength - 3) / 2;
+            return value.Substring(0, halfLength) + "..." + value.Substring(value.Length - halfLength);
+        }
+    }
+}

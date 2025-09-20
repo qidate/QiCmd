@@ -1,0 +1,8 @@
+C:\Users\Administrator\source\repos\QiCmd\QiCmd\bin\Debug\QiCmd.exe.config
+C:\Users\Administrator\source\repos\QiCmd\QiCmd\bin\Debug\QiCmd.exe
+C:\Users\Administrator\source\repos\QiCmd\QiCmd\bin\Debug\QiCmd.pdb
+C:\Users\Administrator\source\repos\QiCmd\QiCmd\obj\Debug\QiCmd.csproj.AssemblyReference.cache
+C:\Users\Administrator\source\repos\QiCmd\QiCmd\obj\Debug\QiCmd.csproj.CoreCompileInputs.cache
+C:\Users\Administrator\source\repos\QiCmd\QiCmd\obj\Debug\QiCmd.exe
+C:\Users\Administrator\source\repos\QiCmd\QiCmd\obj\Debug\QiCmd.pdb
+C:\Users\Administrator\source\repos\QiCmd\QiCmd\obj\Debug\QiCmd.exe.config

@@ -183,7 +183,7 @@ namespace QiCmd
 
     public class QiCmdParser
     {
-        private const bool DeBugMode = true;
+        private const bool DeBugMode = false;
 
         // 时间单位转换字典
         private static readonly Dictionary<char, long> TimeUnits = new Dictionary<char, long>
@@ -289,14 +289,13 @@ namespace QiCmd
                             DateTime.TryParseExact(value, "yyyy-MM-dd HH:mm:ss", null,
                                 System.Globalization.DateTimeStyles.None, out targetDate))
                         {
-                            TimeSpan difference = targetDate - DateTime.Now;
-                            int totalSeconds = (int)difference.TotalSeconds;
+                            // 忽略日期部分，只提取时间
+                            TimeSpan timeOfDay = targetDate.TimeOfDay;
 
-                            OutDebugText($"日期差异 - 现在: {DateTime.Now}, 目标: {targetDate}, 差异: {difference}");
+                            OutDebugText($"时间提取 - 原始: {targetDate}, 时间部分: {timeOfDay}");
 
-                            if (totalSeconds == 0) return "0s";
-                            if (totalSeconds < 0) return "-" + SecondsToTimeFormat(Math.Abs(totalSeconds));
-                            return SecondsToTimeFormat(totalSeconds);
+                            // 转换为已过时间段格式 (15h6m32s)
+                            return TimeSpanToTimeFormat(timeOfDay);
                         }
                         OutDebugText($"解析日期失败: {value}");
                         return value;
@@ -351,12 +350,18 @@ namespace QiCmd
                 return inputCommand;
 
             // 处理管道表达式：支持显式 $[Type:Value => ...] 和隐式 $[?:Value => ...]
-            string pipelinePattern = @"\$\[\s*(\??\w*)\s*:\s*([^=\]]+?)(?:\s*=>\s*([^\]]+))?\s*\]";
+            const string pipelinePattern = @"\$\[\s*(\??\w*|@)\s*:\s*([^=\]]+?)(?:\s*=>\s*([^\]]+))?\s*\]";
             return Regex.Replace(inputCommand, pipelinePattern, match =>
             {
                 string typeName = match.Groups[1].Value;
                 string value = match.Groups[2].Value.Trim();
                 string pipeline = match.Groups[3].Success ? match.Groups[3].Value.Trim() : null;
+
+                // 处理 @ 开头的生成器表达式
+                if (typeName == "@")
+                {
+                    return ParseGeneratorExpression(value, pipeline);
+                }
 
                 // 处理隐式类型（? 或空类型）
                 if (string.IsNullOrEmpty(typeName) || typeName == "?")
@@ -401,6 +406,56 @@ namespace QiCmd
             }
 
             return "String";
+        }
+
+        private static string ParseGeneratorExpression(string functionCall, string pipeline)
+        {
+            // 解析函数名和参数
+            var match = Regex.Match(functionCall, @"(\w+)\(([^)]*)\)");
+            if (!match.Success)
+                return functionCall; // 不是有效的函数调用
+
+            string functionName = match.Groups[1].Value;
+            string argsString = match.Groups[2].Value;
+            string[] args = argsString.Split(',').Select(arg => arg.Trim()).ToArray();
+
+            string generatedValue = GenerateValue(functionName, args);
+
+            // 如果有后续管道，继续处理
+            if (!string.IsNullOrEmpty(pipeline))
+            {
+                return ParsePipelineExpression(DetectValueType(generatedValue), generatedValue, pipeline);
+            }
+
+            return generatedValue;
+        }
+
+        private static string GenerateValue(string functionName, string[] args)
+        {
+            switch (functionName.ToLower())
+            {
+                // 时间与日期
+                case "gettime":
+                    if (args.Length == 1 && args[0].Equals("Now", StringComparison.OrdinalIgnoreCase))
+                    {
+                        DateTime now = DateTime.Now;
+                        return $"{now.Hour}h{now.Minute}m{now.Second}s";
+                    }
+                    break;
+                case "getdate":
+                    if (args.Length == 1 && args[0].Equals("Now", StringComparison.OrdinalIgnoreCase))
+                    {
+                        DateTime now = DateTime.Now;
+                        return $"{now.Date.Year}/{now.Date.Month}/{now.Date.Day} {now.Hour}:{now.Minute}:{now.Second}";
+                    }
+                    break;
+
+                // 
+                case "":
+                    break;
+            }
+
+            return $"[Error: Unknown function '{functionName}']";
         }
 
         /// <summary>
@@ -631,6 +686,38 @@ namespace QiCmd
                 return true;
 
             return false;
+        }
+
+        // 将 TimeSpan 转换为时间格式 (15h6m32s)
+        private static string TimeSpanToTimeFormat(TimeSpan timeSpan)
+        {
+            if (timeSpan.TotalSeconds == 0)
+                return "0s";
+
+            var timeParts = new List<string>();
+
+            // 小时
+            int hours = timeSpan.Hours;
+            if (hours > 0)
+            {
+                timeParts.Add($"{hours}h");
+            }
+
+            // 分钟
+            int minutes = timeSpan.Minutes;
+            if (minutes > 0)
+            {
+                timeParts.Add($"{minutes}m");
+            }
+
+            // 秒
+            int seconds = timeSpan.Seconds;
+            if (seconds > 0)
+            {
+                timeParts.Add($"{seconds}s");
+            }
+
+            return string.Join("", timeParts);
         }
 
         private static void OutDebugText(string message)

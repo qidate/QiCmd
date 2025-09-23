@@ -1,8 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Numerics;
 using System.Runtime.Remoting.Messaging;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -13,11 +15,29 @@ namespace QiCmd
     internal class Program
     {
         private static string _currentDirectory = Environment.CurrentDirectory;
+        private static Dictionary<string, FunctionDefinition> _functions = new Dictionary<string, FunctionDefinition>(StringComparer.OrdinalIgnoreCase);
 
         static void Main(string[] args)
         {
-            Console.Clear();
-            Console.WriteLine("QiCmd [版本 0.1]");
+            if (args.Length >= 1)
+            {
+                for (int i = 0; i < args.Length; ++i)
+                {
+                    string filePath = args[i];
+
+                    if (File.Exists(filePath))
+                        ProcessFile(filePath);
+
+                    else
+                        Console.WriteLine($"文件不存在: {filePath}");
+                }
+                return;
+            }
+
+            var calculator = new NumberCalculator();
+            //Console.Clear();
+            Console.WriteLine("QiCmd [版本 0.3]");
+            //Console.WriteLine(calculator.CalculateFromString("(2 + 1)^3"));
 
             while (true)
             {
@@ -32,14 +52,197 @@ namespace QiCmd
                 if (input.Equals("exit", StringComparison.OrdinalIgnoreCase))
                     break;
 
-                string parsedCommand = QiCmdParser.ParseCommand(input);
-
-                // 处理特殊命令
-                if (TryHandleBuiltInCommand(parsedCommand))
-                    continue;
-
-                ExecuteCommand(parsedCommand);
+                Run(input);
             }
+        }
+
+        private static void Run(string command)
+        {
+            string trimmedCommand = command.Trim();
+
+            // 检查是否是函数调用（忽略前面的空格）
+            if (TryExecuteFunction(trimmedCommand))
+                return;
+
+            string parsedCommand = QiCmdParser.ParseCommand(trimmedCommand);
+
+            // 处理特殊命令
+            if (TryHandleBuiltInCommand(parsedCommand))
+                return;
+
+            ExecuteCommand(parsedCommand);
+        }
+
+        public static void ProcessFile(string filePath)
+        {
+            try
+            {
+                // 读取文件的所有行
+                string[] lines = File.ReadAllLines(filePath);
+
+                // 逐行处理，支持多行函数定义
+                ProcessLinesWithMultilineSupport(lines);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"处理文件时出错: {ex.Message}");
+            }
+        }
+
+        private static void ProcessLinesWithMultilineSupport(string[] lines)
+        {
+            int i = 0;
+            while (i < lines.Length)
+            {
+                string line = lines[i].Trim();
+
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    i++;
+                    continue;
+                }
+
+                // 检查是否是函数定义开始
+                if (line.StartsWith("def ", StringComparison.OrdinalIgnoreCase) &&
+                    line.Contains("=> [") &&
+                    !line.EndsWith("]"))
+                {
+                    // 多行函数定义 - 收集所有相关行
+                    List<string> functionLines = new List<string> { line };
+
+                    i++; // 移动到下一行
+                    int bracketCount = CountBrackets(line);
+
+                    while (i < lines.Length && bracketCount > 0)
+                    {
+                        string currentLine = lines[i].Trim();
+                        functionLines.Add(currentLine);
+                        bracketCount += CountBrackets(currentLine);
+
+                        if (bracketCount <= 0)
+                        {
+                            // 括号匹配完成
+                            i++;
+                            break;
+                        }
+
+                        i++;
+                    }
+
+                    // 处理多行函数定义
+                    ProcessMultilineFunctionDefinition(functionLines);
+                }
+                else
+                {
+                    // 普通行
+                    Run(line);
+                    i++;
+                }
+            }
+        }
+
+        private static void ProcessMultilineFunctionDefinition(List<string> functionLines)
+        {
+            if (functionLines.Count == 0) return;
+
+            // 提取函数定义的第一行（包含 def 函数名 => [）
+            string firstLine = functionLines[0];
+            int arrowIndex = firstLine.IndexOf("=>");
+            if (arrowIndex == -1) return;
+
+            string functionName = firstLine.Substring(0, arrowIndex).Replace("def", "").Trim();
+            if (string.IsNullOrEmpty(functionName)) return;
+
+            // 提取命令部分（移除第一行的 [ 和最后一行的 ]）
+            var commands = new List<string>();
+
+            // 处理第一行（可能包含部分命令）
+            string firstLineCommands = firstLine.Substring(arrowIndex + 2).Trim();
+            if (firstLineCommands.StartsWith("["))
+            {
+                firstLineCommands = firstLineCommands.Substring(1).Trim();
+            }
+
+            if (!string.IsNullOrWhiteSpace(firstLineCommands))
+            {
+                commands.Add(firstLineCommands);
+            }
+
+            // 处理中间行
+            for (int j = 1; j < functionLines.Count - 1; j++)
+            {
+                string cmd = functionLines[j].Trim();
+                if (!string.IsNullOrWhiteSpace(cmd))
+                {
+                    commands.Add(cmd);
+                }
+            }
+
+            // 处理最后一行（移除 ]）
+            if (functionLines.Count > 1)
+            {
+                string lastLine = functionLines[functionLines.Count - 1].Trim();
+                if (lastLine.EndsWith("]"))
+                {
+                    lastLine = lastLine.Substring(0, lastLine.Length - 1).Trim();
+                }
+                if (!string.IsNullOrWhiteSpace(lastLine))
+                {
+                    commands.Add(lastLine);
+                }
+            }
+
+            // 创建函数定义
+            if (commands.Count > 0)
+            {
+                var function = new FunctionDefinition
+                {
+                    Name = functionName,
+                    Commands = commands.ToArray(),
+                    IsSingleLine = false
+                };
+                _functions[functionName] = function;
+            }
+        }
+
+        /// <summary>
+        /// 计算字符串中的括号平衡情况
+        /// </summary>
+        private static int CountBrackets(string line)
+        {
+            int count = 0;
+            foreach (char c in line)
+            {
+                if (c == '[') count++;
+                else if (c == ']') count--;
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// 预处理多行函数定义，将多行合并为单行
+        /// </summary>
+        private static string PreprocessMultilineFunctions(string content)
+        {
+            // 匹配 def 函数名 => [ ... ] 的模式
+            var pattern = @"(def\s+\w+\s*=>\s*\[)(.*?)(\])";
+
+            return Regex.Replace(content, pattern, match =>
+            {
+                string defStart = match.Groups[1].Value;  // def 函数名 => [
+                string commands = match.Groups[2].Value; // 命令内容
+                string defEnd = match.Groups[3].Value;   // ]
+
+                // 将多行命令合并为单行，用分号分隔
+                string[] commandLines = commands.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                                               .Select(cmd => cmd.Trim())
+                                               .Where(cmd => !string.IsNullOrWhiteSpace(cmd))
+                                               .ToArray();
+
+                string mergedCommands = string.Join("; ", commandLines);
+
+                return defStart + mergedCommands + defEnd;
+            }, RegexOptions.Singleline);
         }
 
         private static bool TryHandleBuiltInCommand(string command)
@@ -80,8 +283,180 @@ namespace QiCmd
                     explorer.Run();
                     return true;
 
+                case "def":
+                    HandleDefCommand(command);
+                    return true;
+
+                case "listfuncs":
+                    ListFunctions();
+                    return true;
+
+                case "delfunc":
+                    if (parts.Length > 1)
+                        DeleteFunction(parts[1]);
+                    else
+                        Console.WriteLine("用法: delfunc [函数名]");
+                    return true;
+
                 default:
                     return false;
+            }
+        }
+
+        private static void HandleDefCommand(string command)
+        {
+            try
+            {
+                // 移除开头的def和空格
+                string defContent = command.Substring(3).Trim();
+
+                // 解析函数定义
+                var function = ParseFunctionDefinition(defContent);
+                if (function != null)
+                {
+                    _functions[function.Name] = function;
+                    //Console.WriteLine($"函数 '{function.Name}' 定义成功");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"定义函数时出错: {ex.Message}");
+            }
+        }
+
+        private static void DeleteFunction(string functionName)
+        {
+            if (_functions.ContainsKey(functionName))
+            {
+                _functions.Remove(functionName);
+                Console.WriteLine($"函数 '{functionName}' 已删除");
+            }
+            else
+            {
+                Console.WriteLine($"函数 '{functionName}' 不存在");
+            }
+        }
+
+        private static FunctionDefinition ParseFunctionDefinition(string defContent)
+        {
+            // 查找 => 分隔符
+            int arrowIndex = defContent.IndexOf("=>");
+            if (arrowIndex == -1)
+            {
+                Console.WriteLine("错误: 函数定义必须包含 '=>' 分隔符");
+                return null;
+            }
+
+            // 提取函数名
+            string functionName = defContent.Substring(0, arrowIndex).Trim();
+            if (string.IsNullOrWhiteSpace(functionName))
+            {
+                Console.WriteLine("错误: 函数名不能为空");
+                return null;
+            }
+
+            // 提取命令部分
+            string commandPart = defContent.Substring(arrowIndex + 2).Trim();
+
+            // 检查是否是单行命令还是多行命令
+            if (commandPart.StartsWith("["))
+            {
+                // 多行命令
+                if (!commandPart.EndsWith("]"))
+                {
+                    Console.WriteLine("错误: 多行命令必须以 ']' 结束");
+                    return null;
+                }
+
+                // 移除方括号
+                string commandsText = commandPart.Substring(1, commandPart.Length - 2).Trim();
+
+                // 分割命令（支持分号分隔或原来的多行格式）
+                string[] commands = commandsText.Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                                               .Select(cmd => cmd.Trim())
+                                               .Where(cmd => !string.IsNullOrWhiteSpace(cmd))
+                                               .ToArray();
+
+                if (commands.Length == 0)
+                {
+                    Console.WriteLine("错误: 函数必须包含至少一条命令");
+                    return null;
+                }
+
+                return new FunctionDefinition
+                {
+                    Name = functionName,
+                    Commands = commands,
+                    IsSingleLine = false
+                };
+            }
+            else
+            {
+                // 单行命令
+                return new FunctionDefinition
+                {
+                    Name = functionName,
+                    Commands = new[] { commandPart },
+                    IsSingleLine = true
+                };
+            }
+        }
+
+        private static bool TryExecuteFunction(string command)
+        {
+            string functionName = command.Trim();
+
+            if (_functions.ContainsKey(functionName))
+            {
+                var function = _functions[functionName];
+
+                //OutDebugText($"执行函数: {function.Name}");
+
+                foreach (string cmd in function.Commands)
+                {
+                    if (!string.IsNullOrWhiteSpace(cmd))
+                    {
+                        Run(cmd);
+                    }
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private static void ListFunctions()
+        {
+            if (_functions.Count == 0)
+            {
+                Console.WriteLine("没有定义任何函数");
+                return;
+            }
+
+            Console.WriteLine("已定义的函数:");
+            Console.WriteLine("════════════════════════════════════════════════════════════");
+
+            foreach (var function in _functions.Values)
+            {
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write($"{function.Name}");
+                Console.ResetColor();
+                Console.Write(" => ");
+
+                if (function.IsSingleLine)
+                {
+                    Console.WriteLine(function.Commands[0]);
+                }
+                else
+                {
+                    Console.WriteLine("[");
+                    foreach (string cmd in function.Commands)
+                    {
+                        Console.WriteLine($"  {cmd}");
+                    }
+                    Console.WriteLine("]");
+                }
             }
         }
 
@@ -451,7 +826,11 @@ namespace QiCmd
                     break;
 
                 // 
-                case "":
+                case "ifeo":
+                    if (args.Length == 2)
+                    {
+                        return $"reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\{args[0]}\" /v Debugger /t REG_SZ /d \"{args[1]}\" /f";
+                    }
                     break;
             }
 
@@ -735,6 +1114,310 @@ namespace QiCmd
 
 
 
+
+
+
+
+    // 函数定义类
+    public class FunctionDefinition
+    {
+        public string Name { get; set; }
+        public string[] Commands { get; set; }
+        public bool IsSingleLine { get; set; }
+    }
+
+
+
+    /// <summary>
+    /// 数字计算器类，支持加减乘除和幂运算
+    /// </summary>
+    public class NumberCalculator
+    {
+        // 运算符优先级字典
+        private static readonly Dictionary<char, int> OperatorPrecedence = new Dictionary<char, int>
+        {
+            { '+', 1 },
+            { '-', 1 },
+            { '*', 2 },
+            { '/', 2 },
+            { '^', 3 }  // 幂运算优先级最高
+        };
+
+        /// <summary>
+        /// 执行数学运算
+        /// </summary>
+        public double Calculate(double num1, double num2, char operation)
+        {
+            switch (operation)
+            {
+                case '+':
+                    return Add(num1, num2);
+                case '-':
+                    return Subtract(num1, num2);
+                case '*':
+                    return Multiply(num1, num2);
+                case '/':
+                    return Divide(num1, num2);
+                case '^':
+                    return Power(num1, num2);
+                default:
+                    throw new ArgumentException($"不支持的运算符: {operation}");
+            }
+        }
+
+        /// <summary>
+        /// 加法运算
+        /// </summary>
+        public double Add(double num1, double num2) => num1 + num2;
+
+        /// <summary>
+        /// 减法运算
+        /// </summary>
+        public double Subtract(double num1, double num2) => num1 - num2;
+
+        /// <summary>
+        /// 乘法运算
+        /// </summary>
+        public double Multiply(double num1, double num2) => num1 * num2;
+
+        /// <summary>
+        /// 除法运算
+        /// </summary>
+        public double Divide(double num1, double num2)
+        {
+            if (Math.Abs(num2) < double.Epsilon)
+                throw new DivideByZeroException("除数不能为零");
+            return num1 / num2;
+        }
+
+        /// <summary>
+        /// 幂运算
+        /// </summary>
+        public double Power(double baseNumber, double exponent)
+        {
+            if (Math.Abs(baseNumber) < double.Epsilon && exponent < 0)
+                throw new ArgumentException("0的负数次方无定义");
+            if (baseNumber < 0 && exponent % 1 != 0)
+                throw new ArgumentException("负数的非整数次方无定义");
+            return Math.Pow(baseNumber, exponent);
+        }
+
+        /// <summary>
+        /// 使用调度场算法解析并计算表达式
+        /// </summary>
+        public double CalculateFromString(string expression)
+        {
+            if (string.IsNullOrWhiteSpace(expression))
+                throw new ArgumentException("表达式不能为空");
+
+            // 预处理：移除所有空格
+            expression = new string(expression.Where(c => !char.IsWhiteSpace(c)).ToArray());
+
+            var outputQueue = new Queue<string>();
+            var operatorStack = new Stack<char>();
+
+            int i = 0;
+            while (i < expression.Length)
+            {
+                char currentChar = expression[i];
+
+                if (char.IsDigit(currentChar) || currentChar == '.')
+                {
+                    // 解析数字
+                    string number = ParseNumber(expression, ref i);
+                    outputQueue.Enqueue(number);
+                }
+                else if (IsOperator(currentChar))
+                {
+                    // 处理运算符
+                    while (operatorStack.Count > 0 && IsOperator(operatorStack.Peek()) &&
+                           ((OperatorPrecedence[operatorStack.Peek()] > OperatorPrecedence[currentChar]) ||
+                            (OperatorPrecedence[operatorStack.Peek()] == OperatorPrecedence[currentChar] && currentChar != '^')) &&
+                           operatorStack.Peek() != '(')
+                    {
+                        outputQueue.Enqueue(operatorStack.Pop().ToString());
+                    }
+                    operatorStack.Push(currentChar);
+                    i++;
+                }
+                else if (currentChar == '(')
+                {
+                    operatorStack.Push(currentChar);
+                    i++;
+                }
+                else if (currentChar == ')')
+                {
+                    while (operatorStack.Count > 0 && operatorStack.Peek() != '(')
+                    {
+                        outputQueue.Enqueue(operatorStack.Pop().ToString());
+                    }
+
+                    if (operatorStack.Count == 0)
+                        throw new ArgumentException("括号不匹配");
+
+                    operatorStack.Pop(); // 弹出 '('
+                    i++;
+                }
+                else
+                {
+                    throw new ArgumentException($"无效字符: {currentChar}");
+                }
+            }
+
+            // 将栈中剩余运算符弹出
+            while (operatorStack.Count > 0)
+            {
+                if (operatorStack.Peek() == '(')
+                    throw new ArgumentException("括号不匹配");
+                outputQueue.Enqueue(operatorStack.Pop().ToString());
+            }
+
+            // 计算后缀表达式
+            return EvaluatePostfix(outputQueue);
+        }
+
+        /// <summary>
+        /// 解析数字（支持整数和小数）
+        /// </summary>
+        private string ParseNumber(string expression, ref int index)
+        {
+            int start = index;
+            bool hasDecimalPoint = false;
+
+            while (index < expression.Length)
+            {
+                char c = expression[index];
+                if (char.IsDigit(c))
+                {
+                    index++;
+                }
+                else if (c == '.' && !hasDecimalPoint)
+                {
+                    hasDecimalPoint = true;
+                    index++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            return expression.Substring(start, index - start);
+        }
+
+        /// <summary>
+        /// 判断是否为支持的运算符
+        /// </summary>
+        private bool IsOperator(char c)
+        {
+            return OperatorPrecedence.ContainsKey(c);
+        }
+
+        /// <summary>
+        /// 计算后缀表达式
+        /// </summary>
+        private double EvaluatePostfix(Queue<string> postfixQueue)
+        {
+            var stack = new Stack<double>();
+            var queue = new Queue<string>(postfixQueue); // 创建副本
+
+            while (queue.Count > 0)
+            {
+                string token = queue.Dequeue();
+
+                if (double.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out double number))
+                {
+                    stack.Push(number);
+                }
+                else if (token.Length == 1 && IsOperator(token[0]))
+                {
+                    if (stack.Count < 2)
+                        throw new ArgumentException("表达式无效");
+
+                    double num2 = stack.Pop();
+                    double num1 = stack.Pop();
+                    double result = Calculate(num1, num2, token[0]);
+                    stack.Push(result);
+                }
+                else
+                {
+                    throw new ArgumentException($"无效的令牌: {token}");
+                }
+            }
+
+            if (stack.Count != 1)
+                throw new ArgumentException("表达式无效");
+
+            return stack.Pop();
+        }
+
+        /// <summary>
+        /// 简单的单运算符表达式计算（向后兼容）
+        /// </summary>
+        public double CalculateSimpleExpression(string expression)
+        {
+            if (string.IsNullOrWhiteSpace(expression))
+                throw new ArgumentException("表达式不能为空");
+
+            // 支持的操作符
+            char[] operators = { '+', '-', '*', '/', '^' };
+            int operatorIndex = -1;
+            char operation = ' ';
+
+            // 查找操作符位置（处理负号情况）
+            for (int i = 0; i < expression.Length; i++)
+            {
+                char currentChar = expression[i];
+                if (operators.Contains(currentChar))
+                {
+                    // 检查是否是负号而不是减号
+                    if (currentChar == '-' && (i == 0 || expression[i - 1] == ' ' ||
+                        operators.Contains(expression[i - 1])))
+                    {
+                        continue; // 跳过负号情况
+                    }
+
+                    operatorIndex = i;
+                    operation = currentChar;
+                    break;
+                }
+            }
+
+            if (operatorIndex == -1)
+                throw new ArgumentException($"表达式中未找到有效的运算符。支持的运算符: {string.Join(", ", operators)}");
+
+            // 分割字符串
+            string num1Str = expression.Substring(0, operatorIndex).Trim();
+            string num2Str = expression.Substring(operatorIndex + 1).Trim();
+
+            if (double.TryParse(num1Str, NumberStyles.Float, CultureInfo.InvariantCulture, out double num1) &&
+                double.TryParse(num2Str, NumberStyles.Float, CultureInfo.InvariantCulture, out double num2))
+            {
+                return Calculate(num1, num2, operation);
+            }
+            else
+            {
+                throw new ArgumentException("无法解析表达式中的数字");
+            }
+        }
+
+        /// <summary>
+        /// 显示支持的所有运算符和示例
+        /// </summary>
+        public void DisplaySupportedOperations()
+        {
+            Console.WriteLine("支持的运算:");
+            Console.WriteLine("+ : 加法 (示例: 5 + 3 = 8)");
+            Console.WriteLine("- : 减法 (示例: 10 - 4 = 6)");
+            Console.WriteLine("* : 乘法 (示例: 6 * 7 = 42)");
+            Console.WriteLine("/ : 除法 (示例: 15 / 3 = 5)");
+            Console.WriteLine("^ : 幂运算 (示例: 2 ^ 3 = 8)");
+            Console.WriteLine("支持复杂表达式如: (3 + 2) * 4, 3 ^ 2 + 1, 10 / 2 + 3 * 2");
+            Console.WriteLine();
+        }
+    }
+
+    
 
 
 

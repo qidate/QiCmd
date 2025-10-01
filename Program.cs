@@ -16,6 +16,15 @@ namespace QiCmd
     {
         private static string _currentDirectory = Environment.CurrentDirectory;
         private static Dictionary<string, FunctionDefinition> _functions = new Dictionary<string, FunctionDefinition>(StringComparer.OrdinalIgnoreCase);
+        public static Dictionary<string, VariableDefinition> _variables = new Dictionary<string, VariableDefinition>(StringComparer.OrdinalIgnoreCase);
+        
+        public class VariableDefinition
+        {
+            public string Name { get; set; }
+            public string Value { get; set; }
+            public bool IsExpression { get; set; }  // true 表示表达式变量，false 表示普通变量
+        }
+
 
         static void Main(string[] args)
         {
@@ -35,8 +44,8 @@ namespace QiCmd
             }
 
             var calculator = new NumberCalculator();
-            //Console.Clear();
-            Console.WriteLine("QiCmd [版本 0.3]");
+            Console.Clear();
+            Console.WriteLine("QiCmd [版本 0.4]");
             //Console.WriteLine(calculator.CalculateFromString("(2 + 1)^3"));
 
             while (true)
@@ -64,13 +73,30 @@ namespace QiCmd
             if (TryExecuteFunction(trimmedCommand))
                 return;
 
-            string parsedCommand = QiCmdParser.ParseCommand(trimmedCommand);
+            // 检查是否需要跳过预处理的命令（set, def）
+            if (trimmedCommand.StartsWith("set ", StringComparison.OrdinalIgnoreCase) ||
+                trimmedCommand.StartsWith("def ", StringComparison.OrdinalIgnoreCase))
+            {
+                // 这些命令不进行任何预处理，直接交给 TryHandleBuiltInCommand 处理
+                if (TryHandleBuiltInCommand(trimmedCommand))
+                    return;
+            }
 
-            // 处理特殊命令
-            if (TryHandleBuiltInCommand(parsedCommand))
+            // 对于其他命令：变量 > 表达式 > 命令
+            string processedCommand = trimmedCommand;
+
+            // 1. 变量替换
+            processedCommand = ReplaceVariables(processedCommand);
+
+            // 2. 表达式替换
+            processedCommand = ExecuteTimeExpressionReplacement(processedCommand);
+
+            // 3. 处理特殊命令
+            if (TryHandleBuiltInCommand(processedCommand))
                 return;
 
-            ExecuteCommand(parsedCommand);
+            // 4. 执行命令
+            ExecuteCommand(processedCommand);
         }
 
         public static void ProcessFile(string filePath)
@@ -87,6 +113,40 @@ namespace QiCmd
             {
                 Console.WriteLine($"处理文件时出错: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// 在执行时替换命令中的 $[] 表达式和 [] 表达式
+        /// </summary>
+        public static string ExecuteTimeExpressionReplacement(string command)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+                return command;
+
+            // 使用正则表达式匹配 $[] 表达式和 [] 表达式
+            const string pipelinePattern = @"(\$?)\[\s*(\??\w*|@)\s*:\s*([^=\]]+?)(?:\s*=>\s*([^\]]+))?\s*\]";
+
+            return Regex.Replace(command, pipelinePattern, match =>
+            {
+                string dollarSign = match.Groups[1].Value; // 捕获 $ 符号
+                string typeName = match.Groups[2].Value;
+                string value = match.Groups[3].Value.Trim();
+                string pipeline = match.Groups[4].Success ? match.Groups[4].Value.Trim() : null;
+
+                // 处理 @ 开头的生成器表达式
+                if (typeName == "@")
+                {
+                    return QiCmdParser.ParseGeneratorExpression(value, pipeline);
+                }
+
+                // 处理隐式类型（? 或空类型）
+                if (string.IsNullOrEmpty(typeName) || typeName == "?")
+                {
+                    typeName = QiCmdParser.DetectValueType(value);
+                }
+
+                return QiCmdParser.ParsePipelineExpression(typeName, value, pipeline);
+            });
         }
 
         private static void ProcessLinesWithMultilineSupport(string[] lines)
@@ -192,7 +252,7 @@ namespace QiCmd
                 }
             }
 
-            // 创建函数定义
+            // 创建函数定义 - 保持命令原始形式，不进行预处理
             if (commands.Count > 0)
             {
                 var function = new FunctionDefinition
@@ -256,9 +316,6 @@ namespace QiCmd
             switch (cmd)
             {
                 case "cd":
-                    HandleCdCommand(parts);
-                    return true;
-
                 case "chdir":
                     HandleCdCommand(parts);
                     return true;
@@ -273,7 +330,10 @@ namespace QiCmd
 
                 case "echo":
                     if (parts.Length > 1)
-                        Console.WriteLine(string.Join(" ", parts.Skip(1)));
+                    {
+                        string echoContent = string.Join(" ", parts.Skip(1));
+                        Console.WriteLine(echoContent);
+                    }
                     else
                         Console.WriteLine();
                     return true;
@@ -284,6 +344,7 @@ namespace QiCmd
                     return true;
 
                 case "def":
+                    // def命令不进行表达式替换，保持原始形式
                     HandleDefCommand(command);
                     return true;
 
@@ -298,6 +359,44 @@ namespace QiCmd
                         Console.WriteLine("用法: delfunc [函数名]");
                     return true;
 
+                case "set":
+                    HandleSetCommand(command);
+                    return true;
+
+                case "listvars":
+                    ListVariables();
+                    return true;
+
+                case "delvar":
+                    if (parts.Length > 1)
+                        DeleteVariable(parts[1]);
+                    else
+                        Console.WriteLine("用法: delvar [变量名]");
+                    return true;
+
+                case "run":
+                    HandleRunCommand(command);
+                    return true;
+
+                case "pause":
+                    HandlePauseCommand(parts);
+                    return true;
+
+                case "input":
+                    HandleInputCommand(parts);
+                    return true;
+
+                case "print":
+                    HandlePrintCommand(command);
+                    return true;
+
+                case "color":
+                    HandleColorCommand(parts);
+                    return true;
+
+                case "#":
+                    return true;
+
                 default:
                     return false;
             }
@@ -310,7 +409,7 @@ namespace QiCmd
                 // 移除开头的def和空格
                 string defContent = command.Substring(3).Trim();
 
-                // 解析函数定义
+                // 解析函数定义 - 不进行表达式替换，保持原始形式
                 var function = ParseFunctionDefinition(defContent);
                 if (function != null)
                 {
@@ -372,6 +471,7 @@ namespace QiCmd
                 string commandsText = commandPart.Substring(1, commandPart.Length - 2).Trim();
 
                 // 分割命令（支持分号分隔或原来的多行格式）
+                // 重要：不进行预处理，保持 $[] 表达式的原始形式
                 string[] commands = commandsText.Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
                                                .Select(cmd => cmd.Trim())
                                                .Where(cmd => !string.IsNullOrWhiteSpace(cmd))
@@ -392,7 +492,7 @@ namespace QiCmd
             }
             else
             {
-                // 单行命令
+                // 单行命令 - 保持原始形式
                 return new FunctionDefinition
                 {
                     Name = functionName,
@@ -410,13 +510,15 @@ namespace QiCmd
             {
                 var function = _functions[functionName];
 
-                //OutDebugText($"执行函数: {function.Name}");
-
                 foreach (string cmd in function.Commands)
                 {
                     if (!string.IsNullOrWhiteSpace(cmd))
                     {
-                        Run(cmd);
+                        // 先进行变量替换（确保函数内能访问外部变量）
+                        string varReplacedCommand = ReplaceVariables(cmd);
+
+                        // 然后走完整的 Run 流程（包括表达式替换）
+                        Run(varReplacedCommand);
                     }
                 }
 
@@ -492,12 +594,542 @@ namespace QiCmd
             }
         }
 
+        /// <summary>
+        /// 处理 pause 命令
+        /// </summary>
+        private static void HandlePauseCommand(string[] parts)
+        {
+            bool showText = true;
+
+            // 检查是否有 -notext 或 /notext 参数
+            if (parts.Length > 1)
+            {
+                string arg = parts[1].ToLower();
+                if (arg == "-notext" || arg == "/notext")
+                {
+                    showText = false;
+                }
+                else
+                {
+                    Console.WriteLine($"未知参数: {parts[1]}");
+                    Console.WriteLine("用法: pause [-notext|/notext]");
+                    return;
+                }
+            }
+
+            // 显示提示文本（除非指定了 -notext）
+            if (showText)
+            {
+                Console.Write("请按任意键继续. . . ");
+            }
+
+            // 等待按键
+            Console.ReadKey(true);
+
+            // 如果显示了文本，需要换行
+            if (showText)
+            {
+                Console.WriteLine();
+            }
+        }
+
+        /// <summary>
+        /// 处理 input 命令
+        /// </summary>
+        private static void HandleInputCommand(string[] parts)
+        {
+            try
+            {
+                if (parts.Length < 2)
+                {
+                    Console.WriteLine("用法: input [变量名] [提示信息]");
+                    Console.WriteLine("示例: input name 请输入姓名:");
+                    Console.WriteLine("示例: input age 请输入年龄:");
+                    return;
+                }
+
+                string varName = parts[1];
+
+                // 验证变量名
+                if (!Regex.IsMatch(varName, @"^[a-zA-Z_][a-zA-Z0-9_]*$"))
+                {
+                    Console.WriteLine("错误: 变量名只能包含字母、数字和下划线，且不能以数字开头");
+                    return;
+                }
+
+                // 获取提示信息（从第二个参数开始的所有内容）
+                string prompt = parts.Length > 2 ? string.Join(" ", parts.Skip(2)) : string.Empty;
+
+                // 显示提示信息并等待用户输入
+                Console.Write(string.IsNullOrEmpty(prompt) ? prompt : prompt + " ");
+                string userInput = Console.ReadLine() ?? "";
+
+                // 创建普通变量
+                var variable = new VariableDefinition
+                {
+                    Name = varName,
+                    Value = userInput,
+                    IsExpression = false
+                };
+
+                _variables[varName] = variable;
+                //Console.WriteLine($"变量 '{varName}' 已设置为: {userInput}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"设置输入变量时出错: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 处理 run 命令，执行多个文件
+        /// </summary>
+        private static void HandleRunCommand(string command)
+        {
+            try
+            {
+                // 移除 "run" 关键字
+                string fileArgs = command.Substring(3).Trim();
+
+                if (string.IsNullOrWhiteSpace(fileArgs))
+                {
+                    Console.WriteLine("用法: run [文件1] [文件2] [文件3] ...");
+                    Console.WriteLine("注意: 包含空格的路径需要用引号括起来");
+                    return;
+                }
+
+                // 解析文件路径（支持带空格的路径）
+                var filePaths = ParseFilePaths(fileArgs);
+
+                if (filePaths.Count == 0)
+                {
+                    Console.WriteLine("未找到有效的文件路径");
+                    return;
+                }
+
+                //Console.ForegroundColor = ConsoleColor.Cyan;
+                //Console.WriteLine($"开始执行 {filePaths.Count} 个文件...");
+                //Console.ResetColor();
+                //Console.WriteLine();
+
+                // 处理每个文件
+                foreach (string filePath in filePaths)
+                {
+                    ProcessSingleFile(filePath);
+                }
+
+                //Console.ForegroundColor = ConsoleColor.Green;
+                //Console.WriteLine($"所有文件执行完成!");
+                //Console.ResetColor();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"执行 run 命令时出错: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 解析文件路径，支持带引号的路径
+        /// </summary>
+        private static List<string> ParseFilePaths(string fileArgs)
+        {
+            var filePaths = new List<string>();
+            int i = 0;
+
+            while (i < fileArgs.Length)
+            {
+                // 跳过空格
+                if (char.IsWhiteSpace(fileArgs[i]))
+                {
+                    i++;
+                    continue;
+                }
+
+                // 处理带引号的路径
+                if (fileArgs[i] == '"')
+                {
+                    i++; // 跳过开头的引号
+                    int start = i;
+
+                    // 找到结束引号
+                    while (i < fileArgs.Length && fileArgs[i] != '"')
+                    {
+                        i++;
+                    }
+
+                    if (i < fileArgs.Length)
+                    {
+                        string quotedPath = fileArgs.Substring(start, i - start);
+                        filePaths.Add(quotedPath);
+                        i++; // 跳过结束引号
+                    }
+                }
+                else
+                {
+                    // 处理不带引号的路径
+                    int start = i;
+
+                    while (i < fileArgs.Length && !char.IsWhiteSpace(fileArgs[i]))
+                    {
+                        i++;
+                    }
+
+                    string unquotedPath = fileArgs.Substring(start, i - start);
+                    filePaths.Add(unquotedPath);
+                }
+            }
+
+            return filePaths;
+        }
+
+        /// <summary>
+        /// 处理单个文件
+        /// </summary>
+        private static void ProcessSingleFile(string filePath)
+        {
+            try
+            {
+                // 处理相对路径
+                string fullPath = Path.GetFullPath(Path.Combine(_currentDirectory, filePath));
+
+                if (!File.Exists(fullPath))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"✗ 文件不存在: {filePath}");
+                    Console.ResetColor();
+                    return;
+                }
+
+                //Console.ForegroundColor = ConsoleColor.Yellow;
+                //Console.WriteLine($"执行文件: {filePath}");
+                //Console.ResetColor();
+
+                // 直接调用现有的 ProcessFile 方法
+                ProcessFile(fullPath);
+
+                //Console.ForegroundColor = ConsoleColor.Green;
+                //Console.WriteLine($"✓ 完成: {Path.GetFileName(filePath)}");
+                //Console.ResetColor();
+                Console.WriteLine();
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"执行文件失败 {filePath}: {ex.Message}");
+                Console.ResetColor();
+            }
+        }
+
+        /// <summary>
+        /// 处理 set 命令（支持普通变量和表达式变量）
+        /// </summary>
+        private static void HandleSetCommand(string command)
+        {
+            try
+            {
+                // 移除 "set" 关键字
+                string setContent = command.Substring(3).Trim();
+
+                if (string.IsNullOrWhiteSpace(setContent))
+                {
+                    Console.WriteLine("用法:");
+                    Console.WriteLine("  set [变量名] = [值]          # 普通变量");
+                    Console.WriteLine("  set [变量名] $= [表达式]     # 表达式变量");
+                    Console.WriteLine("示例:");
+                    Console.WriteLine("  set n = 12345");
+                    Console.WriteLine("  set t = $[Time: 1m => Time.Sec]");
+                    Console.WriteLine("  set tr $= $[Time: 1m => Time.Sec]");
+                    return;
+                }
+
+                // 检查是普通变量还是表达式变量
+                bool isExpression = false;
+                int equalsIndex = setContent.IndexOf('=');
+
+                if (equalsIndex > 0 && setContent[equalsIndex - 1] == '$')
+                {
+                    // 表达式变量: set name $= value
+                    isExpression = true;
+                    equalsIndex--; // 移动到 $ 的位置
+                }
+
+                if (equalsIndex == -1)
+                {
+                    Console.WriteLine("错误: 必须使用 '=' 或 '$=' 分隔变量名和值");
+                    return;
+                }
+
+                string varName = setContent.Substring(0, equalsIndex).Trim();
+                string varValue = setContent.Substring(equalsIndex + (isExpression ? 2 : 1)).Trim();
+
+                if (string.IsNullOrWhiteSpace(varName))
+                {
+                    Console.WriteLine("错误: 变量名不能为空");
+                    return;
+                }
+
+                // 验证变量名
+                if (!Regex.IsMatch(varName, @"^[a-zA-Z_][a-zA-Z0-9_]*$"))
+                {
+                    Console.WriteLine("错误: 变量名只能包含字母、数字和下划线，且不能以数字开头");
+                    return;
+                }
+
+                // 第一步：替换变量引用（%varname%）
+                string processedValue = ReplaceVariables(varValue);
+
+                // 第二步：处理表达式
+                string finalValue = processedValue;
+                if (!isExpression && (processedValue.Contains("$[") || processedValue.Contains("[?:")))
+                {
+                    // 普通变量包含表达式，立即计算
+                    finalValue = ExecuteTimeExpressionReplacement(processedValue);
+                }
+
+                // 创建变量定义
+                var variable = new VariableDefinition
+                {
+                    Name = varName,
+                    Value = isExpression ? processedValue : finalValue, // 表达式变量保存替换后的表达式，普通变量保存计算结果
+                    IsExpression = isExpression
+                };
+
+                _variables[varName] = variable;
+
+                //string varType = isExpression ? "表达式变量" : "普通变量";
+                //string displayValue = isExpression ? processedValue : finalValue;
+                //Console.WriteLine($"{varType} '{varName}' 已设置为: {displayValue}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"设置变量时出错: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 列出所有变量
+        /// </summary>
+        private static void ListVariables()
+        {
+            if (_variables.Count == 0)
+            {
+                Console.WriteLine("没有定义任何变量");
+                return;
+            }
+
+            Console.WriteLine("已定义的变量:");
+            Console.WriteLine("════════════════════════════════════════════════════════════");
+
+            foreach (var variable in _variables.Values)
+            {
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write($"{variable.Name}");
+                Console.ResetColor();
+
+                if (variable.IsExpression)
+                {
+                    Console.Write(" $= ");
+                    Console.ForegroundColor = ConsoleColor.Magenta;
+                }
+                else
+                {
+                    Console.Write(" = ");
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                }
+
+                Console.WriteLine(variable.Value);
+                Console.ResetColor();
+            }
+        }
+
+        /// <summary>
+        /// 删除变量
+        /// </summary>
+        private static void DeleteVariable(string varName)
+        {
+            if (_variables.ContainsKey(varName))
+            {
+                _variables.Remove(varName);
+                Console.WriteLine($"变量 '{varName}' 已删除");
+            }
+            else
+            {
+                Console.WriteLine($"变量 '{varName}' 不存在");
+            }
+        }
+
+        /// <summary>
+        /// 替换命令中的变量引用（支持表达式变量动态计算）
+        /// </summary>
+        private static string ReplaceVariables(string command)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+                return command;
+
+            // 匹配 %变量名% 格式
+            const string variablePattern = @"%([a-zA-Z_][a-zA-Z0-9_]*)%";
+
+            return Regex.Replace(command, variablePattern, match =>
+            {
+                string varName = match.Groups[1].Value;
+
+                if (_variables.ContainsKey(varName))
+                {
+                    var variable = _variables[varName];
+
+                    if (variable.IsExpression)
+                    {
+                        // 表达式变量：动态计算
+                        // Console.WriteLine($"DEBUG: 计算表达式变量 '{varName}': {variable.Value}");
+                        string result = ExecuteTimeExpressionReplacement(variable.Value);
+                        // Console.WriteLine($"DEBUG: 计算结果: {result}");
+                        return result;
+                    }
+                    else
+                    {
+                        // 普通变量：直接返回值
+                        return variable.Value;
+                    }
+                }
+                else
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"警告: 变量 '{varName}' 未定义");
+                    Console.ResetColor();
+                    return match.Value; // 保持原样
+                }
+            });
+        }
+
+        /// <summary>
+        /// 处理 color 命令
+        /// </summary>
+        private static void HandleColorCommand(string[] parts)
+        {
+            if (parts.Length < 2)
+            {
+                Console.WriteLine("用法: color [颜色名|reset]");
+                Console.WriteLine("可用颜色:");
+                Console.WriteLine("  black, darkblue, darkgreen, darkcyan, darkred");
+                Console.WriteLine("  darkmagenta, darkyellow, gray, darkgray");
+                Console.WriteLine("  blue, green, cyan, red, magenta, yellow, white");
+                Console.WriteLine("示例:");
+                Console.WriteLine("  color red        # 设置为红色");
+                Console.WriteLine("  color reset      # 重置为默认颜色");
+                return;
+            }
+
+            string colorName = parts[1].ToLower();
+
+            try
+            {
+                switch (colorName)
+                {
+                    case "reset":
+                        Console.ResetColor();
+                        //Console.WriteLine("颜色已重置为默认值");
+                        break;
+
+                    case "black":
+                        Console.ForegroundColor = ConsoleColor.Black;
+                        break;
+                    case "darkblue":
+                        Console.ForegroundColor = ConsoleColor.DarkBlue;
+                        break;
+                    case "darkgreen":
+                        Console.ForegroundColor = ConsoleColor.DarkGreen;
+                        break;
+                    case "darkcyan":
+                        Console.ForegroundColor = ConsoleColor.DarkCyan;
+                        break;
+                    case "darkred":
+                        Console.ForegroundColor = ConsoleColor.DarkRed;
+                        break;
+                    case "darkmagenta":
+                        Console.ForegroundColor = ConsoleColor.DarkMagenta;
+                        break;
+                    case "darkyellow":
+                        Console.ForegroundColor = ConsoleColor.DarkYellow;
+                        break;
+                    case "gray":
+                        Console.ForegroundColor = ConsoleColor.Gray;
+                        break;
+                    case "darkgray":
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        break;
+                    case "blue":
+                        Console.ForegroundColor = ConsoleColor.Blue;
+                        break;
+                    case "green":
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        break;
+                    case "cyan":
+                        Console.ForegroundColor = ConsoleColor.Cyan;
+                        break;
+                    case "red":
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        break;
+                    case "magenta":
+                        Console.ForegroundColor = ConsoleColor.Magenta;
+                        break;
+                    case "yellow":
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        break;
+                    case "white":
+                        Console.ForegroundColor = ConsoleColor.White;
+                        break;
+
+                    default:
+                        Console.WriteLine($"错误: 未知颜色 '{colorName}'");
+                        Console.WriteLine("使用 'color' 命令查看可用颜色列表");
+                        return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"设置颜色时出错: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 处理 print 命令（输出文本，不带换行）
+        /// </summary>
+        private static void HandlePrintCommand(string command)
+        {
+            try
+            {
+                // 移除 "print" 关键字
+                string printContent = command.Substring(5).Trim();
+
+                if (string.IsNullOrWhiteSpace(printContent))
+                {
+                    // 空内容，什么都不输出
+                    return;
+                }
+
+                // 进行变量替换和表达式替换
+                string processedContent = printContent;
+                processedContent = ReplaceVariables(processedContent);
+                processedContent = ExecuteTimeExpressionReplacement(processedContent);
+
+                // 输出文本（不带换行）
+                Console.Write(processedContent);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"执行 print 命令时出错: {ex.Message}");
+            }
+        }
+
         private static void ExecuteCommand(string command)
         {
-            if (IsInteractiveCommand(command))
+            // 在执行命令前进行表达式替换
+            string finalCommand = ExecuteTimeExpressionReplacement(command);
+
+            if (IsInteractiveCommand(finalCommand))
             {
                 // 交互式命令：直接执行，不重定向
-                Process.Start("cmd.exe", $"/C {command}")?.WaitForExit();
+                Process.Start("cmd.exe", $"/C {finalCommand}")?.WaitForExit();
             }
             else
             {
@@ -506,7 +1138,7 @@ namespace QiCmd
                 ProcessStartInfo startInfo = new ProcessStartInfo
                 {
                     FileName = "cmd.exe",
-                    Arguments = $"/C {command}",
+                    Arguments = $"/C {finalCommand}",
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
@@ -751,7 +1383,7 @@ namespace QiCmd
         /// <summary>
         /// 智能检测值的类型
         /// </summary>
-        private static string DetectValueType(string value)
+        public static string DetectValueType(string value)
         {
             value = value.Trim();
 
@@ -783,7 +1415,7 @@ namespace QiCmd
             return "String";
         }
 
-        private static string ParseGeneratorExpression(string functionCall, string pipeline)
+        public static string ParseGeneratorExpression(string functionCall, string pipeline)
         {
             // 解析函数名和参数
             var match = Regex.Match(functionCall, @"(\w+)\(([^)]*)\)");
@@ -825,11 +1457,19 @@ namespace QiCmd
                     }
                     break;
 
-                // 
+                // 映像劫持
                 case "ifeo":
                     if (args.Length == 2)
                     {
                         return $"reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\{args[0]}\" /v Debugger /t REG_SZ /d \"{args[1]}\" /f";
+                    }
+                    break;
+
+                // 数学计算
+                case "maths":
+                    if (args.Length >= 1)
+                    {
+                        return CalculateMathExpression(args[0]);
                     }
                     break;
             }
@@ -840,7 +1480,7 @@ namespace QiCmd
         /// <summary>
         /// 解析管道表达式
         /// </summary>
-        private static string ParsePipelineExpression(string initialType, string initialValue, string pipeline)
+        public static string ParsePipelineExpression(string initialType, string initialValue, string pipeline)
         {
             string currentValue = initialValue;
             string currentType = initialType;
@@ -1065,6 +1705,69 @@ namespace QiCmd
                 return true;
 
             return false;
+        }
+        
+        /// <summary>
+         /// 计算数学表达式（支持变量）
+         /// </summary>
+        private static string CalculateMathExpression(string expression)
+        {
+            try
+            {
+                // 移除可能的引号
+                expression = expression.Trim().Trim('"').Trim('\'');
+
+                // 替换表达式中的变量引用
+                expression = ReplaceVariablesInExpression(expression);
+
+                // 使用 NumberCalculator 计算表达式
+                var calculator = new NumberCalculator();
+                double result = calculator.CalculateFromString(expression);
+
+                return result.ToString(CultureInfo.InvariantCulture);
+            }
+            catch (Exception ex)
+            {
+                return $"[Math Error: {ex.Message}]";
+            }
+        }
+
+        /// <summary>
+        /// 替换表达式中的变量引用
+        /// </summary>
+        private static string ReplaceVariablesInExpression(string expression)
+        {
+            if (string.IsNullOrWhiteSpace(expression))
+                return expression;
+
+            // 匹配 %变量名% 格式
+            const string variablePattern = @"%([a-zA-Z_][a-zA-Z0-9_]*)%";
+
+            return Regex.Replace(expression, variablePattern, match =>
+            {
+                string varName = match.Groups[1].Value;
+
+                if (Program._variables.ContainsKey(varName))
+                {
+                    var variable = Program._variables[varName];
+
+                    if (variable.IsExpression)
+                    {
+                        // 表达式变量：动态计算
+                        string result = Program.ExecuteTimeExpressionReplacement(variable.Value);
+                        return result;
+                    }
+                    else
+                    {
+                        // 普通变量：直接返回值
+                        return variable.Value;
+                    }
+                }
+                else
+                {
+                    return "0"; // 未定义变量返回 0
+                }
+            });
         }
 
         // 将 TimeSpan 转换为时间格式 (15h6m32s)
